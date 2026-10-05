@@ -787,7 +787,13 @@ class _FastStepper:
     PER_BLOCK_MIN = 1.0
     PER_BLOCK_MAX = 64.0
 
-    def __init__(self, m, per_block=PER_BLOCK):
+    # Count in C when a compiler is available (emu/nativehook.py): the same
+    # check-then-count rule as _on_block, without a Python call per block.
+    # Set False (or DIGIKIT_NATIVE_HOOKS=0) to keep the Python hook, e.g. to
+    # wrap _on_block for a block histogram.
+    NATIVE = True
+
+    def __init__(self, m, per_block=PER_BLOCK, native=None):
         if not self.PER_BLOCK_MIN <= per_block <= self.PER_BLOCK_MAX:
             raise ValueError(
                 'instructions per block must be between %g and %g, not %r'
@@ -795,18 +801,49 @@ class _FastStepper:
         self.m = m
         self.per_block = per_block
         self.steps = 0
-        self.blocks = 0
-        self.left = 0
-        m.uc.hook_add(UC_HOOK_BLOCK, self._on_block)
+        self._native = None
+        if self.NATIVE if native is None else native:
+            from emu.nativehook import block_counter
+            self._native = block_counter(m.uc)
+        if self._native is None:
+            self._blocks = 0
+            self._left = 0
+            m.uc.hook_add(UC_HOOK_BLOCK, self._on_block)
+
+    @property
+    def native(self):
+        return self._native is not None
+
+    @property
+    def blocks(self):
+        return self._native.budget.blocks if self._native else self._blocks
+
+    @blocks.setter
+    def blocks(self, value):
+        if self._native:
+            self._native.budget.blocks = int(value)
+        else:
+            self._blocks = value
+
+    @property
+    def left(self):
+        return self._native.budget.left if self._native else self._left
+
+    @left.setter
+    def left(self, value):
+        if self._native:
+            self._native.budget.left = int(value)
+        else:
+            self._left = value
 
     def _on_block(self, uc, addr, size, data):
         # Checked BEFORE counting, so the block that exhausts the step still
         # runs and is still counted, and the one after it is neither.
-        if self.left <= 0:
+        if self._left <= 0:
             uc.emu_stop()
             return
-        self.blocks += 1
-        self.left -= 1
+        self._blocks += 1
+        self._left -= 1
 
     def run(self, pc, step):
         """Execute about `step` instructions from `pc`. -> instructions run."""
@@ -826,7 +863,7 @@ def _fast_stepper(m):
 
 
 def spin(m, pc, instrs, chunk=500_000, on_chunk=None, tick=False, pits=None,
-         fast=False, async_events=()):
+         fast=False, async_events=(), timers_first=False):
     """Run in chunks. -> (pc, executed, stop_reason).
 
     Pass `pits` (an emu.pit.Pits) to run to each timer deadline exactly
@@ -841,6 +878,18 @@ def spin(m, pc, instrs, chunk=500_000, on_chunk=None, tick=False, pits=None,
     exact-deadline sources such as Ssi0Dma. They share the timers' absolute
     instruction clock but retain independent checkpoint components; the
     legacy Timers checkpoint topology is not changed.
+
+    `timers_first` services the timers before the async events at a step
+    boundary. A refused timer tick is dropped (Pits.service), so when an
+    async event's interrupt is raised first on the same boundary, the tick
+    finds the IPL raised and is lost. Taking the timer first and letting the
+    higher-level audio interrupt preempt its handler is what the hardware's
+    priority order gives (emu/live.py passes True). It only helps at an
+    exact tie: emu/live.py also starts the SSI clock half a period away from
+    the timers, because at --ips 150e6 every timer period is a whole number
+    of SSI periods and an SSI event a few instructions BEFORE each timer
+    deadline made PIT0, PIT2 and DTIM3 find the CPU in the audio ISRs every
+    time (the RTOS tick and the UI loop nearly stopped).
 
     A `Pits` holds its deadlines as absolute instruction counts, and `done`
     here restarts at zero on every call, so successive calls with the same
@@ -932,9 +981,12 @@ def spin(m, pc, instrs, chunk=500_000, on_chunk=None, tick=False, pits=None,
         done += executed
         if pits is not None:
             pits.now = base + done
+            if timers_first:
+                pits.service(base + done)
             for event in async_events:
                 event.service(base + done)
-            pits.service(base + done)
+            if not timers_first:
+                pits.service(base + done)
             # raise_vector moves PC. Resuming at the stale one leaves the
             # exception frame stranded on the stack: the next rts pops it as
             # a return address and jumps to nowhere. Cost a session once, as

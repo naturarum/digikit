@@ -48,6 +48,11 @@ save the screen. `--bench SECONDS` measures speed with no input.
 `--ssi0-hz` (with `--ips 150e6`) runs the audio clock, so PLAY runs the
 sequencer; see docs/LIVE.md "Audio clock". No sound: the DSP is not
 emulated (emu/dsp.py only answers its ready line).
+
+DIN MIDI (UART9, emu/midi.py) is modelled: `--midi-log`, `--midi-file`,
+and with python-rtmidi a virtual `--midi-port` out and `--midi-in`. The
+panel LEDs (UART8 messages to the panel MCU, emu/leds.py) are drawn on the
+keys and saved next to every headless `png`.
 """
 import argparse
 import collections
@@ -60,7 +65,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from unicorn import UC_HOOK_MEM_READ
-from unicorn.m68k_const import UC_M68K_REG_A7
+from unicorn.m68k_const import UC_M68K_REG_A7, UC_M68K_REG_PC
 
 from emu import config, device as devices, panel, panelin, symbols
 from emu.dspboot import find_idle_spins, MAIN_LOAD
@@ -443,6 +448,60 @@ class KeyInput:
         return [act.label for act in self.down.values()]
 
 
+# --- live MIDI ports (virtual CoreMIDI / ALSA ports, via python-rtmidi) ----
+
+def _rtmidi():
+    try:
+        import rtmidi
+    except ImportError:
+        raise SystemExit('--midi-port / --midi-in need python-rtmidi: run with '
+                         '`uv run --with python-rtmidi python -m emu.live ...`')
+    return rtmidi
+
+
+class LiveMidiOut:
+    """A virtual MIDI output named `name` that other apps (a DAW, a synth
+    via an interface) can read. Bytes from the emulated DIN out are parsed
+    and each message is sent as soon as it is complete. Only a virtual port
+    is ever opened: no hardware device is touched."""
+
+    def __init__(self, name):
+        from emu.midi import Parser
+        self.out = _rtmidi().MidiOut()
+        self.out.open_virtual_port(name)
+        self.parser = Parser()
+        self.sent = 0
+
+    def byte(self, t, b):
+        for _, msg in self.parser.feed(t, b):
+            self.out.send_message(list(msg))
+            self.sent += 1
+
+    def close(self):
+        try:
+            self.out.close_port()
+        except Exception:                # noqa: BLE001
+            pass
+
+
+class LiveMidiIn:
+    """A virtual MIDI input named `name`: what other apps send to it goes
+    to the emulated unit's DIN in. Virtual port only."""
+
+    def __init__(self, name, post):
+        self.inp = _rtmidi().MidiIn()
+        self.inp.ignore_types(sysex=False, timing=False, active_sense=True)
+        self.inp.open_virtual_port(name)
+        self.inp.set_callback(lambda event, data=None: post(bytes(event[0])))
+
+    def close(self):
+        try:
+            self.inp.cancel_callback()
+            self.inp.close_port()
+        except Exception:                # noqa: BLE001
+            pass
+
+
 # --- the emulator worker ----------------------------------------------------
 
 def frame_to_fb(buf, fb):
@@ -474,8 +533,21 @@ class LiveEmulator(threading.Thread):
                  dwell_ms=25.0, post_intro_ips=4 * INSTR_PER_SEC,
                  keep_frames=900, verbose=False, save_at_exit=None,
                  dtim0_hz=DTIM0_HZ, encoder_mode='step', raw_counts=4,
-                 ssi0_hz=None, dsp_sync=True, ips=None):
+                 ssi0_hz=None, dsp_sync=True, ips=None, midi=True,
+                 midi_port=None, midi_in_port=None, midi_log=None,
+                 midi_file=None, midi_bpm=120.0):
         super().__init__()
+        self.midi_enabled = midi           # model UART9 (DIN MIDI)
+        self.midi_port = midi_port         # name of a virtual CoreMIDI out
+        self.midi_in_port = midi_in_port   # name of a virtual CoreMIDI in
+        self.midi_log_path = midi_log      # text log written at the end
+        self.midi_file = midi_file         # .mid written at the end
+        self.midi_bpm = midi_bpm
+        self.midi = None
+        self.leds = None                   # emu/leds.py PanelLeds
+        self._uart_mark = 0
+        self.midi_inbox = collections.deque()
+        self._midi_live = None
         self.ips = ips                     # emulated CPU rate; None: as saved
         self.dtim0_hz = dtim0_hz
         self.ssi0_hz = ssi0_hz             # None: no audio clock (as before)
@@ -520,6 +592,7 @@ class LiveEmulator(threading.Thread):
             'latency_ms': None, 'load_s': 0.0, 'terminal': False,
             'idle_skips': 0, 'latches': 0,
             'ssi_blocks': 0, 'vec170': 0, 'vec191': 0,
+            'midi_out': 0, 'midi_in': 0,
         }
         self._latch = None
         self._watch = None               # (t_input, raw_before, instrs)
@@ -532,6 +605,16 @@ class LiveEmulator(threading.Thread):
         """Queue one panel event (press, release, encoder, release_all)."""
         self.inbox.append((kind, code, arg, time.monotonic()))
         self.wake.set()
+
+    def post_midi(self, data):
+        """Queue bytes for the emulated unit's MIDI in (any thread)."""
+        self.midi_inbox.append(bytes(data))
+        self.wake.set()
+
+    def emu_time(self):
+        """Emulated seconds, inside a step too (worker thread)."""
+        s = self._stepper
+        return self._emu_s + s.blocks * s.per_block / self._step_ips
 
     def stop(self):
         self.stop_flag.set()
@@ -596,6 +679,17 @@ class LiveEmulator(threading.Thread):
             if not self.ssi0._checkpoint_restored or self.ips:
                 self.ssi0.ips = timers.sources[0].ips
             self.ssi0.align(timers.now)
+            # Half a period out of phase with the timers. A snapshot is saved
+            # on a timer deadline, and at --ips 150e6 every timer period is a
+            # whole number of SSI periods, so aligned on `timers.now` each
+            # SSI event fell a few instructions before a PIT/DTIM deadline:
+            # the timer then found the CPU in the channel-50 ISR (IPL 7) and
+            # the tick was dropped, every time (PIT0, PIT2 and DTIM3 ~100%
+            # missed, the RTOS tick and the UI loop stopped). The real phase
+            # is unknown; half a period leaves the frame handler time to
+            # finish before the next timer tick.
+            if self.ssi0.next is not None and not self.ssi0._checkpoint_restored:
+                self.ssi0.next += self.ssi0.period / 2
             if self.dsp_sync:
                 # Stand-in for the SHARC: its sync word at the head of every
                 # row of both RX banks. The SSI model never writes RX data,
@@ -604,6 +698,18 @@ class LiveEmulator(threading.Thread):
                     for row in range(DSP_SYNC_ROWS):
                         m.uc.mem_write(bank + row * DSP_SYNC_ROW_BYTES,
                                        DSP_SYNC_WORD)
+
+        # Panel LEDs: seeded from the firmware's own copies, then decoded
+        # from the UART8 stream to the panel MCU (emu/leds.py).
+        from emu.leds import PanelLeds
+        self.leds = PanelLeds()
+        img = open(config.main_image(), 'rb').read()
+        if PanelLeds.image_matches(img, MAIN_LOAD):
+            self.leds.from_memory(m.uc, img, MAIN_LOAD)
+        else:
+            print('[live] LED tables not found in this image; LEDs from the '
+                  'wire only', flush=True)
+        self._uart_mark = len(ev['uart_out'])
 
         stats = self.stats
         if profile.mainloop is not None:
@@ -633,8 +739,23 @@ class LiveEmulator(threading.Thread):
                 self._latch = buf
                 break
         stepper = _fast_stepper(m)
+        self._stepper = stepper
         self._emu_s = 0.0
         self._step_ips = timers.sources[0].ips
+        if self.midi_enabled:
+            # DIN MIDI on UART9 (emu/midi.py): out by eDMA 37 and by PIO,
+            # in by eDMA 36. Bytes are logged with emulated time stamps.
+            from emu import midi as midimod
+            if self.midi_port:
+                self._midi_live = LiveMidiOut(self.midi_port)
+            self.midi = midimod.install(
+                m, ev, clock=self.emu_time,
+                on_byte=self._midi_live.byte if self._midi_live else None)
+            if self.midi is None:
+                print('[live] UART9 is not set up as on 1.12; no MIDI',
+                      flush=True)
+            elif self.midi_in_port:
+                self._midi_in = LiveMidiIn(self.midi_in_port, self.post_midi)
         if self.dtim0_hz:
             # DTIM0's counter is the firmware's free-running time base: the
             # panel driver stamps every key and encoder record with it
@@ -647,7 +768,7 @@ class LiveEmulator(threading.Thread):
             hz = self.dtim0_hz
 
             def dtcn(uc, typ, addr, size, val, data):
-                t = self._emu_s + stepper.blocks * stepper.per_block / self._step_ips
+                t = self.emu_time()
                 uc.mem_write(DTIM0_DTCN, struct.pack(
                     '>I', int(t * hz) & 0xFFFFFFFF))
             m.uc.hook_add(UC_HOOK_MEM_READ, dtcn, begin=DTIM0_DTCN,
@@ -696,6 +817,21 @@ class LiveEmulator(threading.Thread):
                 at(addr, on_idle)
         self.stats['load_s'] = time.monotonic() - t0
         return m, ev, pc, timers, profile, stepper
+
+    def write_midi(self):
+        """Write --midi-log / --midi-file from what was sent so far."""
+        from emu import midi as midimod
+        log = self.midi.log if self.midi is not None else []
+        if self.midi_log_path:
+            midimod.write_log(self.midi_log_path, log)
+            print('[live] MIDI log %s (%d bytes)' % (self.midi_log_path, len(log)),
+                  flush=True)
+        if self.midi_file:
+            msgs = midimod.parse([(w, b) for _, w, b, _ in log])
+            with open(self.midi_file, 'wb') as fh:
+                fh.write(midimod.smf(msgs, bpm=self.midi_bpm, t0=0.0))
+            print('[live] MIDI file %s (%d messages, time 0 = start of the run)'
+                  % (self.midi_file, len(msgs)), flush=True)
 
     def _make_detent_hook(self, m):
         """One key press = one parameter step, whatever the parameter.
@@ -753,7 +889,8 @@ class LiveEmulator(threading.Thread):
         t0 = time.monotonic()
         win_t, win_emu, win_instrs, win_skip = t0, 0.0, 0, 0
         per_block = stepper.per_block
-        asyncs = tuple(e for e in (self.ssi0, getattr(self, 'intfrc', None))
+        asyncs = tuple(e for e in (self.ssi0, getattr(self, 'intfrc', None),
+                                   self.midi)
                        if e is not None)
         while not self.stop_flag.is_set():
             if self.pause.is_set():
@@ -770,8 +907,14 @@ class LiveEmulator(threading.Thread):
             ips = timers.sources[0].ips
             pc = self._deliver(m, profile, pc, emu_s, ips)
             self._emu_s, self._step_ips = emu_s, ips
+            if self.midi_inbox and self.midi is not None:
+                data = b''.join(self.midi_inbox.popleft()
+                                for _ in range(len(self.midi_inbox)))
+                if self.midi.feed(data):
+                    stats['midi_in'] += len(data)
+                pc = m.uc.reg_read(UC_M68K_REG_PC)
             pc, executed, why = spin(m, pc, 1, pits=timers, fast=True,
-                                     async_events=asyncs)
+                                     async_events=asyncs, timers_first=True)
             if why != 'limit':
                 stats['status'] = 'halted: %s' % why
                 print('[live] HALTED: %s at pc=0x%08x' % (why, pc), flush=True)
@@ -779,6 +922,10 @@ class LiveEmulator(threading.Thread):
             stats['instrs'] += executed
             emu_s += executed / ips
             stats['emu_s'] = emu_s
+            out = ev['uart_out']
+            if len(out) != self._uart_mark:
+                self.leds.feed(bytes(out[self._uart_mark:]))
+                self._uart_mark = len(out)
             self._publish()
             now = time.monotonic()
             if now - win_t >= 0.5:
@@ -795,6 +942,8 @@ class LiveEmulator(threading.Thread):
                 stats['pit'] = (fired.get('PIT0', 0), fired.get('PIT2', 0),
                                 fired.get('PIT3', 0))
                 stats['dtim3'] = fired.get('DTIM3', 0)
+                if self.midi is not None:
+                    stats['midi_out'] = len(self.midi.log)
                 if self.ssi0 is not None:
                     stats['ssi_blocks'] = self.ssi0.major_loops[50]
                     stats['vec170'] = self.ssi0.vector170
@@ -817,6 +966,13 @@ class LiveEmulator(threading.Thread):
                     t0 = now - emu_s / self.speed - MAX_LAG_S
         else:
             stats['status'] = 'stopped'
+        if self.midi is not None:
+            stats['midi_out'] = len(self.midi.log)
+            self.write_midi()
+        if self._midi_live is not None:
+            self._midi_live.close()
+        if getattr(self, '_midi_in', None) is not None:
+            self._midi_in.close()
         if self.save_at_exit:
             from emu.checkpoint import save_longrun
             save_longrun(m, ev, timers, self.save_at_exit,
@@ -924,14 +1080,75 @@ def _window_classes():
     import tkinter as tk
     from emu import gui
 
+    def hex_colour(rgb):
+        return '#%02x%02x%02x' % rgb
+
+    class LedKey(gui.CanvasKey):
+        """A key with its LED: a lit strip along the top of the key face,
+        in the colour the firmware sent the panel (emu/leds.py)."""
+
+        led = None                    # (r, g, b) 8-bit, or None: no LED
+
+        def set_led(self, rgb):
+            if rgb != self.led:
+                self.led = rgb
+                self._draw()
+
+        def _draw(self):
+            super()._draw()
+            if self.led is None:
+                return
+            width = int(self.cget('width'))
+            inset = 3 if self.pressed else 1
+            self.create_rectangle(inset + 4, inset + 4, width - 7, inset + 8,
+                                  fill=hex_colour(self.led), outline='')
+
     class LiveControls(gui.Controls):
-        """emu/gui.py's control surface with each key's shortcut on it."""
+        """emu/gui.py's control surface with each key's shortcut on it,
+        and the panel LEDs drawn on the keys (plus the 8 round LEDs)."""
 
         def __init__(self, master, device, button_names, encoder_names, send,
                      scale, shortcuts):
             self.shortcuts = shortcuts
+            self.led_keys = {}            # button code -> [LedKey]
             super().__init__(master, device, button_names, encoder_names,
                              send, scale)
+            box = tk.Frame(self, bg=self.BG)
+            box.grid(row=2, column=0, pady=(0, 6))
+            tk.Label(box, text='PAGE LEDS', bg=self.BG, fg='#7f8b9c',
+                     font=('TkFixedFont', 7)).pack(side='left', padx=(0, 6))
+            self.round_canvas = tk.Canvas(box, width=8 * 18, height=14,
+                                          bg=self.BG, highlightthickness=0)
+            self.round_canvas.pack(side='left')
+            self.round_dots = [self.round_canvas.create_oval(
+                3 + 18 * i, 2, 13 + 18 * i, 12, fill='#202428', outline='#434c57')
+                for i in range(8)]
+
+        def _button(self, box, code, text, accent=None, width=48, height=32):
+            accent = accent or self.AMBER
+            if code in self._latching:
+                widget = LedKey(box, text, accent=accent, width=width,
+                                height=height,
+                                on_press=lambda c=code: self._toggle_latch(c, widget))
+            else:
+                widget = LedKey(box, text, accent=accent, width=width,
+                                height=height,
+                                on_press=lambda c=code: self.send('press', c, 0),
+                                on_release=lambda c=code: self.send('release', c, 0))
+            self.led_keys.setdefault(code, []).append(widget)
+            return widget
+
+        def set_leds(self, leds):
+            """Draw a PanelLeds state on the keys and the round LEDs."""
+            for led, code in leds.led_codes.items():
+                rgb = leds.rgb8(led)
+                for widget in self.led_keys.get(code, ()):
+                    widget.set_led(rgb)
+            for n, led in enumerate(sorted(leds.led_names)[:8]):
+                rgb = leds.rgb8(led)
+                self.round_canvas.itemconfigure(
+                    self.round_dots[n],
+                    fill=hex_colour(rgb) if any(rgb) else '#202428')
 
         def _group_labels(self, group):
             labels = super()._group_labels(group)
@@ -950,8 +1167,10 @@ def _window_classes():
         def __init__(self, snapshot, syx, keymap, speed=1.0, idle_skip=True,
                      dwell_ms=25.0, scale=None, verbose=False,
                      dtim0_hz=DTIM0_HZ, encoder_mode='step', raw_counts=4,
-                     save_at_exit=None, ssi0_hz=None, dsp_sync=True, ips=None):
+                     save_at_exit=None, ssi0_hz=None, dsp_sync=True, ips=None,
+                     live_extra=None):
             self.keymap = keymap
+            self._live_extra = dict(live_extra or {})
             self._live = dict(syx=syx, speed=speed, idle_skip=idle_skip,
                               dwell_ms=dwell_ms, verbose=verbose,
                               dtim0_hz=dtim0_hz, encoder_mode=encoder_mode,
@@ -959,6 +1178,7 @@ def _window_classes():
                               ssi0_hz=ssi0_hz, dsp_sync=dsp_sync, ips=ips)
             self.keys = None
             self.help = None
+            self._leds_shown = -1
             super().__init__(snapshot, syx=syx, scale=scale)
             self.title('Digitone II live (? for the key map)')
             self.keys = KeyInput(keymap, self.send_input)
@@ -1001,7 +1221,7 @@ def _window_classes():
                                     save_at_exit=o['save_at_exit'],
                                     ssi0_hz=o['ssi0_hz'],
                                     dsp_sync=o['dsp_sync'],
-                                    ips=o['ips'])
+                                    ips=o['ips'], **self._live_extra)
             self.emu.start()
 
         def send_input(self, kind, code, arg):
@@ -1087,11 +1307,17 @@ def _window_classes():
                     if self.panel is not None and e.version != self.shown:
                         self.panel.draw(e.fb)
                         self.shown = e.version
+                    if (self.controls is not None and e.leds is not None
+                            and e.leds.version != self._leds_shown):
+                        self._leds_shown = e.leds.version
+                        self.controls.set_leds(e.leds)
                     s = e.stats
                     lat = s['latency_ms']
                     self.frames_lbl.configure(
-                        text='%.2fx real time   CPU load %.0f%%   %.1fM instr/s'
-                             % (s['real'], 100 * s['load'], s['wall_ips'] / 1e6))
+                        text='%.2fx real time   CPU load %.0f%%   %.1fM instr/s   '
+                             'MIDI out %d in %d bytes'
+                             % (s['real'], 100 * s['load'], s['wall_ips'] / 1e6,
+                                s['midi_out'], s['midi_in']))
                     held = ', '.join(self.keys.held_labels()) if self.keys else ''
                     self.status.configure(
                         text='%s   last key %s   held: %s\n'
@@ -1127,12 +1353,24 @@ def wait_frames(emu, keys, seconds):
                                                          or emu.stats['status']))
 
 
+def wait_emulated(emu, keys, seconds):
+    """Wait until `seconds` of EMULATED time have passed (whatever the
+    emulator's speed against the wall clock)."""
+    end = emu.stats['emu_s'] + seconds
+    while emu.stats['emu_s'] < end:
+        wait_frames(emu, keys, 0.005)
+
+
 def save_png(emu, path):
+    """The screen as PNG + ASCII, and the LEDs as PATH.leds.{json,txt,png}."""
     if emu.raw is None:
         raise RuntimeError('no frame yet for %s' % path)
     panel.write_png(emu.raw, path)
-    with open(os.path.splitext(path)[0] + '.txt', 'w') as fh:
+    base = os.path.splitext(path)[0]
+    with open(base + '.txt', 'w') as fh:
         fh.write('\n'.join(panel.ascii_art(emu.raw)) + '\n')
+    if emu.leds is not None:
+        emu.leds.save(base, names=emu.button_names)
 
 
 def run_script(emu, keymap, lines, outdir, log=print):
@@ -1140,10 +1378,12 @@ def run_script(emu, keymap, lines, outdir, log=print):
 
     Commands, one per line (# starts a comment):
         wait S          let S seconds of wall time pass
+        wait-emu S      let S seconds of emulated time pass
         down KEY        key down (KEY is a keysym; shift+KEY for Shift)
         up KEY          key up
         tap KEY [S]     down, hold S seconds (default 0.12), up
         png NAME        save the screen as OUTDIR/NAME.png (+ .txt)
+        midi-in HEX     send bytes to the unit's DIN MIDI in (e.g. 90 3c 64)
     """
     keys = KeyInput(keymap, emu.post)
     for n, raw in enumerate(lines, 1):
@@ -1153,6 +1393,8 @@ def run_script(emu, keymap, lines, outdir, log=print):
         cmd, *args = line.split()
         if cmd == 'wait':
             wait_frames(emu, keys, float(args[0]))
+        elif cmd == 'wait-emu':
+            wait_emulated(emu, keys, float(args[0]))
         elif cmd in ('down', 'tap'):
             key, shift = parse_key(args[0])
             act = keys.key_down(key, shift)
@@ -1164,6 +1406,12 @@ def run_script(emu, keymap, lines, outdir, log=print):
         elif cmd == 'up':
             keys.key_up(parse_key(args[0])[0])
             wait_frames(emu, keys, keys.release_delay + 0.01)
+        elif cmd == 'midi-in':
+            data = bytes.fromhex(''.join(args))
+            emu.post_midi(data)
+            log('[script] midi-in %s (emulated %.3f s)' % (data.hex(),
+                                                          emu.stats['emu_s']))
+            wait_frames(emu, keys, 0.01)
         elif cmd == 'png':
             path = os.path.join(outdir, args[0] + '.png')
             save_png(emu, path)
@@ -1199,6 +1447,14 @@ def summary(emu):
         lines.append('forced interrupts taken: %s' % (
             ', '.join('vector %d x%d' % kv for kv in sorted(s.get('forced', {}).items()))
             or 'none'))
+    if emu.midi is not None:
+        from emu.midi import parse
+        msgs = parse([(w, b) for _, w, b, _ in emu.midi.log])
+        lines.append('DIN MIDI: out %d bytes (%d messages), in %d bytes; '
+                     'vectors 156/157/181 x%d/%d/%d'
+                     % (len(emu.midi.log), len(msgs), emu.midi.rx_bytes,
+                        emu.midi.taken[156], emu.midi.taken[157],
+                        emu.midi.taken[181]))
     if lat:
         lat_sorted = sorted(lat)
         lines.append('input -> changed frame: n=%d  median %.0f ms  min %.0f  '
@@ -1242,6 +1498,21 @@ def main(argv=None):
                          'snapshot\'s timer rate); try 150e6 with --ssi0-hz')
     ap.add_argument('--no-dsp-sync', action='store_true',
                     help='with --ssi0-hz: do not plant the SHARC sync word')
+    ap.add_argument('--no-midi', action='store_true',
+                    help='do not model DIN MIDI (UART9)')
+    ap.add_argument('--midi-log', help='write the DIN MIDI out bytes, with '
+                    'emulated time stamps, and the parsed messages here')
+    ap.add_argument('--midi-file', help='write DIN MIDI out as a Standard '
+                    'MIDI File here (time 0 = start of the run)')
+    ap.add_argument('--midi-bpm', type=float, default=120.0,
+                    help='tempo written into --midi-file (default 120; use '
+                         'the project tempo so bars line up)')
+    ap.add_argument('--midi-port', nargs='?', const='Digitone II (emulator)',
+                    help='open a virtual MIDI output with this name and send '
+                         'DIN MIDI out to it live (needs python-rtmidi)')
+    ap.add_argument('--midi-in', nargs='?', const='Digitone II (emulator) in',
+                    help='open a virtual MIDI input with this name; what is '
+                         'sent to it reaches the DIN MIDI in (needs python-rtmidi)')
     ap.add_argument('--scale', type=int)
     ap.add_argument('--verbose', action='store_true',
                     help='print every delivered input as a guirun --feed')
@@ -1271,7 +1542,10 @@ def main(argv=None):
                 dtim0_hz=args.dtim0_hz, encoder_mode=args.encoder_mode,
                 raw_counts=args.raw_counts, save_at_exit=args.save,
                 ssi0_hz=args.ssi0_hz, ips=args.ips,
-                dsp_sync=not args.no_dsp_sync).mainloop()
+                dsp_sync=not args.no_dsp_sync,
+                live_extra=dict(midi=not args.no_midi, midi_port=args.midi_port,
+                    midi_in_port=args.midi_in, midi_log=args.midi_log,
+                    midi_file=args.midi_file, midi_bpm=args.midi_bpm)).mainloop()
         return 0
 
     emu = LiveEmulator(args.snapshot, syx=args.syx, speed=args.speed,
@@ -1281,7 +1555,9 @@ def main(argv=None):
                        encoder_mode=args.encoder_mode,
                        raw_counts=args.raw_counts,
                        ssi0_hz=args.ssi0_hz, dsp_sync=not args.no_dsp_sync,
-                       ips=args.ips)
+                       ips=args.ips, midi=not args.no_midi, midi_port=args.midi_port,
+                       midi_in_port=args.midi_in, midi_log=args.midi_log,
+                       midi_file=args.midi_file, midi_bpm=args.midi_bpm)
     t0 = time.monotonic()
     emu.start()
     emu.ready.wait()

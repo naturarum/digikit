@@ -206,10 +206,12 @@ class Ssi0Dma:
     def service(self, done):
         self.now = int(done)
         if self.next is not None and done >= self.next:
-            for _ in range(self.per_event):
-                self.requests += 1
-                self._run_minor(RX_CHAN, capture_tx=False)
-                self._run_minor(TX_CHAN, capture_tx=True)
+            # The two channels have separate descriptors and the RX side
+            # writes no data, so running each channel's batch in one go is
+            # the same as interleaving them request by request.
+            self.requests += self.per_event
+            self._run_minors(RX_CHAN, self.per_event, capture_tx=False)
+            self._run_minors(TX_CHAN, self.per_event, capture_tx=True)
             self.next += self.period
             if self.next <= done:
                 self.next = Fraction(done) + self.period
@@ -234,6 +236,82 @@ class Ssi0Dma:
         self.m.uc.mem_write(
             self._tcd(channel) + offset, struct.pack(">H", value & 0xFFFF)
         )
+
+    # The whole TCD in one read: SADDR ATTR SOFF NBYTES SLAST DADDR CITER
+    # DOFF DLAST BITER CSR (ColdFire order, see emu/edma.py).
+    _TCD = struct.Struct(">IHhIiIHhiHH")
+
+    def _run_minors(self, channel, count, capture_tx):
+        """`count` requests on one channel. -> major loops completed.
+
+        Same result as `count` calls of _run_minor (which stays the
+        reference), with one TCD read per run of minors instead of a dozen
+        register reads per minor: the audio clock serves 96,000 requests a
+        second, and per-minor Python was half of all wall time.
+        """
+        if channel not in self.enabled or count <= 0:
+            return 0
+        uc = self.m.uc
+        base = self._tcd(channel)
+        majors = 0
+        while count > 0:
+            (source, attr, source_offset, nbytes, slast, dest, citer_raw,
+             dest_offset, dlast, biter_raw, csr) = self._TCD.unpack(
+                bytes(uc.mem_read(base, 0x20)))
+            if citer_raw & 0x8000 or biter_raw & 0x8000:
+                raise RuntimeError("Ssi0Dma does not support linked CITER/BITER")
+            citer = citer_raw & 0x7FFF
+            if not citer:
+                return majors
+            source_size = 1 << (attr & 0x7)
+            dest_size = 1 << ((attr >> 8) & 0x7)
+            if source_size != 4 or dest_size != 4:
+                raise RuntimeError("Ssi0Dma only supports the observed 32-bit transfers")
+            if not nbytes or nbytes % source_size:
+                raise RuntimeError("invalid SSI eDMA minor-loop byte count")
+            words = nbytes // source_size
+            run = min(count, citer)
+            count -= run
+            if capture_tx:
+                captured = bytearray()
+                if source_offset == source_size:
+                    captured += uc.mem_read(source, nbytes * run)
+                else:
+                    for i in range(words * run):
+                        captured += uc.mem_read(
+                            (source + i * source_offset) & 0xFFFFFFFF, source_size)
+                if captured:
+                    self.tx_bytes += len(captured)
+                    self.tx_crc32 = zlib.crc32(captured, self.tx_crc32)
+            source = (source + source_offset * words * run) & 0xFFFFFFFF
+            dest = (dest + dest_offset * words * run) & 0xFFFFFFFF
+            citer -= run
+            if citer:
+                uc.mem_write(base + SADDR, struct.pack(">I", source))
+                uc.mem_write(base + DADDR, struct.pack(">I", dest))
+                uc.mem_write(base + CITER, struct.pack(">H", citer))
+                return majors
+            # Major loop complete: as in _run_minor.
+            majors += 1
+            source = (source + slast) & 0xFFFFFFFF
+            self.major_loops[channel] += 1
+            if csr & 0x0010:  # E_SG
+                # The SADDR/DADDR/CITER writes are overwritten by the new
+                # descriptor, exactly as in _run_minor.
+                pointer = dlast & 0xFFFFFFFF
+                if pointer & 0x1F:
+                    raise RuntimeError("SSI scatter/gather pointer is not 32-byte aligned")
+                uc.mem_write(base, bytes(uc.mem_read(pointer, 0x20)))
+                self.scatter_gathers[channel] += 1
+            else:
+                dest = (dest + dlast) & 0xFFFFFFFF
+                uc.mem_write(base + SADDR, struct.pack(">I", source))
+                uc.mem_write(base + DADDR, struct.pack(">I", dest))
+                uc.mem_write(base + CITER, struct.pack(">H", biter_raw))
+            if channel == TX_CHAN and csr & 0x0002:  # INT_MAJOR
+                self.int50_asserted = True
+                self.int50_delivered = False
+        return majors
 
     def _run_minor(self, channel, capture_tx):
         if channel not in self.enabled:

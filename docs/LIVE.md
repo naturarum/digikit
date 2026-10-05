@@ -127,7 +127,7 @@ the wall clock; a key press wakes it at once.
 | | result |
 |---|---|
 | snapshot load / first frame | 0.7-0.8 s / 0.7 s |
-| main screen, as fast as possible, idle skipping on | 1.95x real time (36.5M instr/s, 25% of instructions not skipped) |
+| main screen, as fast as possible, idle skipping on | 1.95x real time (36.5M instr/s, 25% of instructions not skipped); 8.0x with the C block counter (T2.4c, see Speed below) |
 | same, idle skipping off | 0.22x real time (4.2M instr/s) |
 | real-time pacing | 1.00-1.01x |
 | key press to changed screen (28 presses: arrows, page keys, encoders, trigs) | median 52 ms, 22-146 ms wall (emulated median 35 ms) |
@@ -144,10 +144,15 @@ uv run python -m emu.live SNAP --syx FW --bench 20 --speed 0
 ```
 
 No Tk window is created. A script runs the same `KeyInput` the window uses,
-one command per line: `wait S`, `down KEY`, `up KEY`, `tap KEY [HOLD_S]`,
-`png NAME` (writes DIR/NAME.png and an ASCII .txt). KEY is a Tk keysym
-(`space`, `bracketleft`, `Down`, `F4`), `shift+KEY` for Shift. Timing is
-wall-clock, in real time.
+one command per line: `wait S`, `wait-emu S`, `down KEY`, `up KEY`,
+`tap KEY [HOLD_S]`, `midi-in HEX` (bytes to the DIN MIDI in, e.g.
+`midi-in 90 3c 64`), `png NAME` (writes DIR/NAME.png, an ASCII .txt and the
+LED state as NAME.leds.json/.txt/.png). KEY is a Tk keysym (`space`,
+`bracketleft`, `Down`, `F4`), `shift+KEY` for Shift. `wait` and tap holds
+are wall-clock; `wait-emu` waits for emulated time, which is what to use
+when the emulator is not at real time (the audio clock, `--speed 0`). With
+`--speed 0` a `tap` lasts 0.12 s of *wall* time, which can be seconds of
+emulated time; keep scripts that type into menus at the default `--speed 1`.
 
 ## Audio clock (`--ssi0-hz`)
 
@@ -183,23 +188,101 @@ which the plain emulator does not run. With it:
   per step) advances 5.4 steps a second of emulated audio, which is 81 BPM
   in sixteenths; trig LED messages (`0xB9 index value` on UART8) change
   while playing and stop after STOP.
-- Cost: 0.1-0.2x real time on an M2 Pro with the clock on (1.95x without).
-  The Python work per block, not the guest's instructions, is the limit;
-  not profiled yet.
+- The SSI clock starts half a period after the timers' clock. Aligned on
+  it, every SSI event at `--ips 150e6` fell a few instructions before a
+  PIT/DTIM deadline (a snapshot is saved on a deadline and every timer
+  period is a whole number of SSI periods); the timer then found the CPU in
+  the channel-50 ISR and the tick was dropped, every time: the RTOS tick
+  and the UI loop nearly stopped (no LED refresh, 3 main-loop messages in
+  2 s). `spin(timers_first=True)` also takes a timer before an audio
+  interrupt that is due on the same instruction.
+- Cost: about 0.8x real time on an M2 Pro with the clock on, playing or
+  not (8x without the clock). See Speed.
 - The harness now emulates BITREV and BYTEREV (ISA_C), which Unicorn lacks;
   1.12 executes BITREV at `0x4002aa80` as soon as the sequencer plays.
+
+## DIN MIDI (`emu/midi.py`)
+
+On by default (`--no-midi` turns it off). UART9 at 31,250 baud is the DIN
+port on Digitone II 1.12: out by eDMA channel 37 (a 4 KB ring, completion
+vector 157) and, for single realtime bytes, by programmed I/O with the
+UART9 interrupt (vector 181); in by eDMA channel 36 into a 32 KB ring
+(vector 156). The model runs a transfer when it is started and queues its
+completion; bytes are logged with emulated time stamps.
+
+    --midi-log FILE    every byte sent: time handed to the UART, time on the
+                       wire (31,250 baud, back to back), path; then the
+                       parsed messages
+    --midi-file F.mid  the messages as a Standard MIDI File, format 0;
+                       time 0 = start of the run; start/continue/stop as
+                       markers, clock ticks left out (they are in the log)
+    --midi-bpm 81      the tempo written into the file, so bars line up
+    --midi-port [NAME] a virtual MIDI output ("Digitone II (emulator)"):
+                       plug the emulator into a synth or DAW on the Mac
+    --midi-in [NAME]   a virtual MIDI input ("Digitone II (emulator) in")
+                       whose messages reach the DIN in
+
+The ports need python-rtmidi: `uv run --with python-rtmidi python -m
+emu.live ...`. Only virtual ports are created; no device is opened.
+
+Checked on 1.12 (El-Fw `notes/T2.4c-midi-leds-speed.md`): with CLOCK SEND
+and TRANSPORT SEND switched on in SETTINGS > MIDI CONFIG > SYNC and track
+1 set to the MIDI machine (CHAN enabled with FUNC + encoder A push), PLAY
+sends `FA`, clock at 80.9 BPM (24 ppq) for the project's 81.0, and
+`90 3C 64` on trigs 1, 5, 9, 13 exactly 4.000 sixteenths apart at 81 BPM,
+each ended by `90 3C 00` one sixteenth later; STOP sends `FC`. MIDI in:
+`FA` and 24 ppq clock start the sequencer on the external clock (6 clocks
+a step), `FC` stops it. Through the virtual ports the timing is the
+emulator's: at 0.8x real time the notes come 20% slow.
+
+## Panel LEDs (`emu/leds.py`)
+
+The firmware drives the LEDs through the panel MCU on UART8: `B9 index
+value` sets LED `index` to palette entry `value`, `B5 index r g b` sets a
+palette entry (6 bits a channel). Palette: 0 off, 1 the dim unlit glow,
+then 16 levels each of red, green, blue, yellow, cyan, magenta, white and
+orange from 2, six specials at 130-135. Which key each LED belongs to comes
+from the factory UI test's own tables. The window draws each key's LED as a
+coloured strip along its top, and the 8 round LEDs (the pattern page
+indicator on the main screen) under the panel. `png` in a script also saves
+the LED state. What lights on 1.12: STOP white when stopped, PLAY green
+when playing, RECORD red, the active page key white, the selected track's
+trig key dim red, the playhead red on the trig keys, triggering tracks
+flashing white, all trig keys green while FUNC is held, TEMPO blinking.
+
+## Speed (1.12, warm snapshot, Apple M2 Pro, `--speed 0`)
+
+| | emulated s per wall s |
+|---|---|
+| main screen, no audio clock | 8.0 (was 1.95) |
+| audio clock on, stopped | 0.81 |
+| audio clock on, playing | 0.82 (was 0.10) |
+
+Three changes, none of which changes what the guest sees: the fast
+stepper's block budget is counted in C (`emu/nativehook.py`, compiled once
+with the system `cc` into `~/.cache/digikit-native/`; `DIGIKIT_NATIVE_HOOKS=0`
+keeps the Python hook), the SSI model runs a batch of eDMA minors with one
+descriptor read (`Ssi0Dma._run_minors`), and the timer/SSI phase fix above
+(which costs a little speed back, because the UI now runs). With the clock
+on, most of the remaining time is Unicorn running the guest's own frame
+work, about 30M instructions per emulated second (the SHARC frame builder
+`0x400db28e` and its helpers are two thirds of it).
 
 ## Limits
 
 - **No sound.** The DSP is not emulated; emu/dsp.py only answers its ready
   line.
-- **PLAY needs `--ssi0-hz`** (see Audio clock), and then runs at
-  0.1-0.2x real time.
+- **PLAY needs `--ssi0-hz`** (see Audio clock), and then runs at about
+  0.8x real time on an M2 Pro.
 - **Empty +Drive.** The eSDHC model completes commands without data, so
   projects and presets cannot be loaded, and FUNC+YES says "Prj must be
   re-saved!".
-- **No LEDs, no MIDI.** Trig LEDs and key lights are not shown; MIDI in and
-  out are not connected.
+- **MIDI is DIN only.** USB MIDI (the firmware's other port, bit 1 of its
+  port mask) is not modelled. The UART is ideal: bytes leave at once, no
+  framing errors, no 31,250-baud throttling of what the firmware queues
+  (the log computes when each byte would be on the wire).
+- **LEDs**: the 10-byte bitmap blocks the firmware also sends the panel MCU
+  (heads 0x10-0x16) are not decoded.
 - The encoder step model is a keyboard convenience, not the feel of the real
   knob; `--encoder-mode raw` is closer to the hardware path.
 - Static screens are rendered only when the firmware redraws (once per

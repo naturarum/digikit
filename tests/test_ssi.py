@@ -166,6 +166,54 @@ class Ssi0DmaTest(unittest.TestCase):
         source.service(1)
         self.assertEqual(machine.vectors, [(191, 5)])
 
+    def _sg_pair(self, machine, citer, short=None):
+        """RX and TX in scatter/gather between two banks, as on 1.12.
+        `short` gives the second TX descriptor a shorter major loop."""
+        put_tcd(machine, RX_CHAN, source=RX_REGISTER, dest=0x5000, citer=citer,
+                link=0x3100, csr=0x10)
+        rx_a = machine.uc.mem_read(TCD_BASE + RX_CHAN * 0x20, 0x20)
+        put_tcd(machine, RX_CHAN, source=RX_REGISTER, dest=0x5800, citer=citer,
+                link=0x30C0, csr=0x10)
+        rx_b = machine.uc.mem_read(TCD_BASE + RX_CHAN * 0x20, 0x20)
+        put_tcd(machine, TX_CHAN, source=0x1000, dest=TX_REGISTER,
+                citer=short or citer, link=0x3040, csr=0x12)
+        tx_b = machine.uc.mem_read(TCD_BASE + TX_CHAN * 0x20, 0x20)
+        put_tcd(machine, TX_CHAN, source=0x1800, dest=TX_REGISTER, citer=citer,
+                link=0x3000, csr=0x12)
+        tx_a = machine.uc.mem_read(TCD_BASE + TX_CHAN * 0x20, 0x20)
+        machine.uc.mem_write(0x3000, tx_b)
+        machine.uc.mem_write(0x3040, tx_a)
+        machine.uc.mem_write(0x30C0, rx_a)
+        machine.uc.mem_write(0x3100, rx_b)
+        machine.uc.mem_write(TCD_BASE + RX_CHAN * 0x20, rx_a)
+        machine.uc.mem_write(TCD_BASE + TX_CHAN * 0x20, tx_a)
+        machine.uc.mem_write(0x1000, bytes(range(256)) * 16)
+
+    def test_batched_minors_match_one_by_one(self):
+        """_run_minors(n) leaves memory and counters as n x _run_minor,
+        across major loops, scatter/gather and a shortened loop."""
+        for citer, short, batches in ((64, None, (64, 64, 64)),
+                                      (64, 62, (64, 64, 64, 64)),
+                                      (8, 3, (5, 7, 1, 13, 64)),
+                                      (4, None, (0, 1, 2, 3, 4, 9))):
+            a_machine, a = self.make_source()
+            b_machine, b = self.make_source()
+            for machine in (a_machine, b_machine):
+                self._sg_pair(machine, citer, short)
+            for source in (a, b):
+                source.enabled.update((RX_CHAN, TX_CHAN))
+            for n in batches:
+                for _ in range(n):
+                    a._run_minor(RX_CHAN, capture_tx=False)
+                    a._run_minor(TX_CHAN, capture_tx=True)
+                b._run_minors(RX_CHAN, n, capture_tx=False)
+                b._run_minors(TX_CHAN, n, capture_tx=True)
+                self.assertEqual(a_machine.uc.memory, b_machine.uc.memory)
+                for field in ('major_loops', 'scatter_gathers', 'tx_bytes',
+                              'tx_crc32', 'int50_asserted', 'int50_delivered'):
+                    self.assertEqual(getattr(a, field), getattr(b, field),
+                                     (citer, short, n, field))
+
     def test_checkpoint_round_trip_and_rate_mismatch(self):
         machine, original = self.make_source(request_hz=48000, ips=4680000)
         original.enabled.update((RX_CHAN, TX_CHAN))
