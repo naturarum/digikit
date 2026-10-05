@@ -57,7 +57,7 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
           modeled_vectors=None,
           trace=None, trace_path=None, trace_ranges=(), trace_registers=None,
           deferred_components=(), idle_yield=20000, ssi0_request_hz=None,
-          ssi0_legacy_upgrade=False):
+          ssi0_legacy_upgrade=False, ssi0_per_event=1):
     """Stand up a hooked Machine and restore `snapshot` onto it.
 
     -> (m, ev, st, pc, inq, at) where `at(addr, fn)` registers a further
@@ -405,6 +405,7 @@ def build(snapshot, send=b'', syx=None, isa='scoped',
             request_hz=int(ssi0_request_hz),
             instr_per_sec=INSTR_PER_SEC,
             force_rte=profile.ssi0_dma_force_rte,
+            per_event=ssi0_per_event,
         )
 
     if dsp:                            # see emu/dsp.py

@@ -59,11 +59,19 @@ def _signed(value, bits):
 class Ssi0Dma:
     """Exact-deadline SSI request source for the observed DT2 descriptors."""
 
-    def __init__(self, machine, request_hz, instr_per_sec, at=None, force_rte=None):
+    def __init__(self, machine, request_hz, instr_per_sec, at=None, force_rte=None,
+                 per_event=1):
         if request_hz <= 0 or instr_per_sec <= 0:
             raise ValueError("SSI request and instruction rates must be positive")
+        if per_event < 1:
+            raise ValueError("per_event must be at least one request")
         self.m = machine
         self.request_hz = int(request_hz)
+        # Requests served per event. 1 is exact. A larger batch (the minors
+        # in one major loop) stops the emulator that many times less often;
+        # the interrupt then lands at the batch's end, which is where a
+        # major-loop interrupt is due anyway when the batch is aligned.
+        self.per_event = int(per_event)
         self.ips = int(instr_per_sec)
         self.now = 0
         self.next = None
@@ -94,7 +102,7 @@ class Ssi0Dma:
 
     @property
     def period(self):
-        return Fraction(self.ips, self.request_hz)
+        return Fraction(self.ips * self.per_event, self.request_hz)
 
     def align(self, now):
         """Start a fresh SSI clock at an explicit legacy-upgrade boundary."""
@@ -141,6 +149,7 @@ class Ssi0Dma:
             "type": "Ssi0Dma",
             "version": 1,
             "request_hz": self.request_hz,
+            "per_event": self.per_event,
             "ips": self.ips,
             "now": self.now,
             "next": next_value,
@@ -163,6 +172,8 @@ class Ssi0Dma:
             raise RuntimeError("unsupported Ssi0Dma checkpoint state")
         if state.get("request_hz") != self.request_hz:
             raise RuntimeError("Ssi0Dma request-rate mismatch")
+        if state.get("per_event", 1) != self.per_event:
+            raise RuntimeError("Ssi0Dma batch-size mismatch")
         self.ips = state["ips"]
         self.now = state["now"]
         raw_next = state["next"]
@@ -195,9 +206,10 @@ class Ssi0Dma:
     def service(self, done):
         self.now = int(done)
         if self.next is not None and done >= self.next:
-            self.requests += 1
-            self._run_minor(RX_CHAN, capture_tx=False)
-            self._run_minor(TX_CHAN, capture_tx=True)
+            for _ in range(self.per_event):
+                self.requests += 1
+                self._run_minor(RX_CHAN, capture_tx=False)
+                self._run_minor(TX_CHAN, capture_tx=True)
             self.next += self.period
             if self.next <= done:
                 self.next = Fraction(done) + self.period
@@ -245,12 +257,16 @@ class Ssi0Dma:
         dest = self._u32(channel, DADDR)
         source_offset = _signed(self._u16(channel, SOFF), 16)
         dest_offset = _signed(self._u16(channel, DOFF), 16)
+        words = nbytes // source_size
         captured = bytearray()
-        for _ in range(nbytes // source_size):
-            if capture_tx:
-                captured += self.m.uc.mem_read(source, source_size)
-            source = (source + source_offset) & 0xFFFFFFFF
-            dest = (dest + dest_offset) & 0xFFFFFFFF
+        if capture_tx and source_offset == source_size:
+            captured += self.m.uc.mem_read(source, nbytes)   # one contiguous read
+        elif capture_tx:
+            for i in range(words):
+                captured += self.m.uc.mem_read(
+                    (source + i * source_offset) & 0xFFFFFFFF, source_size)
+        source = (source + source_offset * words) & 0xFFFFFFFF
+        dest = (dest + dest_offset * words) & 0xFFFFFFFF
         self._w32(channel, SADDR, source)
         self._w32(channel, DADDR, dest)
         citer -= 1
@@ -355,13 +371,15 @@ class Ssi0Dma:
         return False
 
 
-def install(machine, at, events, request_hz, instr_per_sec, force_rte):
+def install(machine, at, events, request_hz, instr_per_sec, force_rte,
+            per_event=1):
     source = Ssi0Dma(
         machine,
         request_hz=request_hz,
         instr_per_sec=instr_per_sec,
         at=at,
         force_rte=force_rte,
+        per_event=per_event,
     )
     events["ssi0_dma"] = source
     return source

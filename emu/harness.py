@@ -7,6 +7,9 @@ Unicorn's m68k core has gaps that matter here. All are handled below:
 
   * FF1.L (0x04C0-0x04C7) is not implemented. Left alone, boot stalls at 444
     distinct code addresses; emulated, it reaches 36,474. Biggest single win.
+  * BITREV.L and BYTEREV.L (0x00C0-0x00C7, 0x02C0-0x02C7, ISA_C) raise
+    vector 4. Digitone II 1.12 runs BITREV at 0x4002aa80 (bit-mask scan
+    with FF1) as soon as the sequencer plays.
   * MOVEC with Rc=0x009 does not fault -- it aborts the process (SIGABRT).
     It must be intercepted in the code hook, before Unicorn's decoder sees it.
   * m68k exceptions are never dispatched through the vector table.
@@ -27,6 +30,14 @@ except ImportError:
 # Memory-fault type constants, used to label what Machine._fault records.
 # Imported defensively: not every unicorn build exposes every one of these,
 # and a missing constant should shrink FAULT_KINDS rather than break import.
+def _bitrev32(v):
+    return int('{:032b}'.format(v)[::-1], 2)
+
+
+def _byterev32(v):
+    return int.from_bytes(v.to_bytes(4, 'big'), 'little')
+
+
 _FAULT_KIND_NAMES = {
     'UC_MEM_READ_UNMAPPED': 'read-unmapped',
     'UC_MEM_WRITE_UNMAPPED': 'write-unmapped',
@@ -89,6 +100,10 @@ class Machine:
         self._srtrap_target = 0
         self.ctlregs = {}       # MOVEC control registers
         self.ff1_count = 0
+        # Called after every `rte` with the restored SR in place: the moment
+        # a level-sensitive source the IPL was blocking becomes deliverable
+        # (emu/intfrc.py). Each callback may raise one vector.
+        self.after_rte = []
         self.movec_count = 0
         self.mmio_trace_hooks = []
         self._owned_trace = None
@@ -286,6 +301,12 @@ class Machine:
                 self.ff1_count += 1
             return h
 
+        def make_rev(reg, fn):
+            def h(uc, addr, size, data):
+                uc.reg_write(reg, fn(uc.reg_read(reg) & 0xFFFFFFFF))
+                uc.reg_write(UC_M68K_REG_PC, addr + 2)
+            return h
+
         def make_movec(addr, w):
             def h(uc, addr_, size, data):
                 ext = struct.unpack('>H', uc.mem_read(addr + 2, 2))[0]
@@ -307,6 +328,10 @@ class Machine:
                 reg = UC_M68K_REG_D0 + (w & 7)
                 self.uc.hook_add(UC_HOOK_CODE, make_ff1(reg), begin=addr, end=addr)
                 n_ff1 += 1
+            elif 0x00C0 <= w <= 0x00C7 or 0x02C0 <= w <= 0x02C7:
+                reg = UC_M68K_REG_D0 + (w & 7)
+                fn = _bitrev32 if w < 0x0200 else _byterev32
+                self.uc.hook_add(UC_HOOK_CODE, make_rev(reg, fn), begin=addr, end=addr)
             elif w in (0x4E7A, 0x4E7B):
                 self.uc.hook_add(UC_HOOK_CODE, make_movec(addr, w), begin=addr, end=addr)
                 n_movec += 1
@@ -326,6 +351,12 @@ class Machine:
                 uc.reg_write(reg, out)
                 uc.reg_write(UC_M68K_REG_PC, addr + 2)
                 self.ff1_count += 1
+                return
+            if 0x00C0 <= w <= 0x00C7 or 0x02C0 <= w <= 0x02C7:   # BITREV / BYTEREV
+                reg = UC_M68K_REG_D0 + (w & 7)
+                fn = _bitrev32 if w < 0x0200 else _byterev32
+                uc.reg_write(reg, fn(uc.reg_read(reg) & 0xFFFFFFFF))
+                uc.reg_write(UC_M68K_REG_PC, addr + 2)
                 return
             if w in (0x4E7A, 0x4E7B):                 # MOVEC -- crashes Unicorn
                 ext = struct.unpack('>H', uc.mem_read(addr + 2, 2))[0]
@@ -351,6 +382,8 @@ class Machine:
                 uc.reg_write(UC_M68K_REG_SR, sr)
                 uc.reg_write(UC_M68K_REG_PC, pc)
                 uc.reg_write(UC_M68K_REG_A7, sp + 8)
+                for callback in self.after_rte:
+                    callback()
                 return
             # A synchronous `trap #N` must resume *after* the trap, so let
             # raise_vector advance the pushed PC past it. Asynchronous

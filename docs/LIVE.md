@@ -68,7 +68,7 @@ accepted. `--keymap FILE` remaps (lines of `KEY KIND CODE [LABEL]`, KIND
 | Delete, Fwd Del, Esc | NO | closes menus / "Prj must be re-saved!" |
 | arrow keys | UP DOWN LEFT RIGHT | move cursors; on the main screen Up/Down page the SYN pages / FUNC + Up or Down: TRIG MODE |
 | 0 | RECORD | record icon in the header / "Copy Pattern A01" |
-| - | PLAY | nothing visible (see Limits) / "Cleared 1 sequence!" |
+| - | PLAY | runs the sequencer with `--ssi0-hz` (see Audio clock); nothing visible on the SYN page / "Cleared 1 sequence!" |
 | = | STOP | nothing visible / nothing visible |
 | Z | KEYBOARD | scale name in the header / keyboard set-up (octave, mode, root, scale) |
 | X / C | MINUS / PLUS | nothing visible / -1 / +1 on the track box |
@@ -149,14 +149,52 @@ one command per line: `wait S`, `down KEY`, `up KEY`, `tap KEY [HOLD_S]`,
 (`space`, `bracketleft`, `Down`, `F4`), `shift+KEY` for Shift. Timing is
 wall-clock, in real time.
 
+## Audio clock (`--ssi0-hz`)
+
+Without it, PLAY does nothing: the sequencer is paced by the audio clock,
+which the plain emulator does not run. With it:
+
+    uv run python -m emu.live SNAPSHOT --syx FIRMWARE.syx --ssi0-hz --ips 150e6
+
+- `--ssi0-hz` runs emu/ssi.py's SSI0/eDMA48/50 model. Bare, it is 96,000
+  requests a second: 64 requests fill one RX bank of 32 rows, so one
+  eDMA50 major loop (vector 170) per 32-sample block at 48 kHz, 1,500 a
+  second, the SHARC's own block rate. The model serves the 64 requests of a
+  major loop in one event, so the emulator stops 1,500 times a second, not
+  96,000.
+- The SHARC is not emulated, so its sync word `0x007fffff` is planted at
+  the head of every row of both RX banks (`0x4e6e7100`, `0x4e6e7900` on
+  Digitone II 1.12). The vector-170 handler `0x400d55d4` counts 64 aligned
+  blocks, then installs the real channel-50 ISR `0x40025386`, which forces
+  vector 191, the frame handler. `--no-dsp-sync` leaves the banks alone
+  (the handover then never happens).
+- emu/intfrc.py delivers the software-forced interrupts the frame handler
+  raises: INTFRCH0 bit 12 (vector 108, the sequencer clock `0x400d79c8`),
+  which forces bit 25 (vector 121, the step handler `0x400d99de`). They are
+  level-sensitive and are taken after every `rte` and at every step
+  boundary when the IPL allows.
+- `--ips` sets the emulated CPU rate. The default rate (4x 4.68M) is far
+  below the unit's 250 MHz MCF54418; at 1,500 frame interrupts a second it
+  leaves the UI task no time and the screen stops redrawing. At 150M the
+  emulated CPU load is about 20%, and idle skipping makes the spare time
+  free.
+- Checked: with the warm snapshot's project at 81.0 BPM (shown on screen),
+  the sequencer position (`0x42c4f900`, +900,000 per sub-step, 5,400,000
+  per step) advances 5.4 steps a second of emulated audio, which is 81 BPM
+  in sixteenths; trig LED messages (`0xB9 index value` on UART8) change
+  while playing and stop after STOP.
+- Cost: 0.1-0.2x real time on an M2 Pro with the clock on (1.95x without).
+  The Python work per block, not the guest's instructions, is the limit;
+  not profiled yet.
+- The harness now emulates BITREV and BYTEREV (ISA_C), which Unicorn lacks;
+  1.12 executes BITREV at `0x4002aa80` as soon as the sequencer plays.
+
 ## Limits
 
 - **No sound.** The DSP is not emulated; emu/dsp.py only answers its ready
   line.
-- **PLAY does not run the sequencer.** After PLAY the screen stayed
-  byte-identical for 20 s. The audio-rate SSI0/eDMA interrupt chain that
-  paces the ColdFire-DSP exchange (emu/ssi.py, opt-in, board clock unknown)
-  is not modelled here, which is the likely reason; not checked.
+- **PLAY needs `--ssi0-hz`** (see Audio clock), and then runs at
+  0.1-0.2x real time.
 - **Empty +Drive.** The eSDHC model completes commands without data, so
   projects and presets cannot be loaded, and FUNC+YES says "Prj must be
   re-saved!".

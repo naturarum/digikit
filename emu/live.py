@@ -45,7 +45,9 @@ created): `--script FILE` runs key events from a file through exactly the
 same KeyInput -> inbox -> panel path the window uses, and `png NAME` lines
 save the screen. `--bench SECONDS` measures speed with no input.
 
-No sound: the DSP is not emulated (emu/dsp.py only answers its ready line).
+`--ssi0-hz` (with `--ips 150e6`) runs the audio clock, so PLAY runs the
+sequencer; see docs/LIVE.md "Audio clock". No sound: the DSP is not
+emulated (emu/dsp.py only answers its ready line).
 """
 import argparse
 import collections
@@ -97,6 +99,21 @@ DTIM0_DTCN = 0xFC07000C
 # Its rate on the unit is not known: no code in the firmware file programs
 # DTIM0. The bus clock with no prescale is the plain guess.
 DTIM0_HZ = 132_000_000
+
+# The audio clock (--ssi0-hz). On the unit the SHARC clocks SSI0, and
+# every completed eDMA50 major loop (64 minors of 32 bytes) raises vector
+# 170. The Digitone II 1.12 vector-170 handler 0x400d55d4 scans the RX
+# bank just filled (32 rows of 64 bytes at 0x4e6e7100 or 0x4e6e7900) for
+# the peer's sync word 0x007fffff at the head of row 0; after 64 aligned
+# blocks it installs the real channel-50 ISR (0x40025386), which forces
+# vector 191, the frame handler that runs the sequencer and the DSP frame.
+# 96,000 requests/s gives one major loop per 32-sample block at 48 kHz
+# (1,500 per second), the DSP's own block rate (El-Fw notes/T3.4).
+SSI0_HZ_DN2 = 96_000
+SSI0_MINORS_PER_BLOCK = 64
+DSP_SYNC_WORD = b'\x00\x7f\xff\xff'
+DSP_SYNC_BANKS = (0x4E6E7100, 0x4E6E7900)
+DSP_SYNC_ROWS, DSP_SYNC_ROW_BYTES = 32, 0x40
 
 
 # --- keyboard map -------------------------------------------------------
@@ -456,9 +473,14 @@ class LiveEmulator(threading.Thread):
     def __init__(self, snapshot, syx=None, speed=1.0, idle_skip=True,
                  dwell_ms=25.0, post_intro_ips=4 * INSTR_PER_SEC,
                  keep_frames=900, verbose=False, save_at_exit=None,
-                 dtim0_hz=DTIM0_HZ, encoder_mode='step', raw_counts=4):
+                 dtim0_hz=DTIM0_HZ, encoder_mode='step', raw_counts=4,
+                 ssi0_hz=None, dsp_sync=True, ips=None):
         super().__init__()
+        self.ips = ips                     # emulated CPU rate; None: as saved
         self.dtim0_hz = dtim0_hz
+        self.ssi0_hz = ssi0_hz             # None: no audio clock (as before)
+        self.dsp_sync = dsp_sync           # plant the SHARC's sync word
+        self.ssi0 = None
         self.encoder_mode = encoder_mode   # 'step' or 'raw'
         self.raw_counts = raw_counts
         self._detents = {}                  # channel -> [count, emu_s]
@@ -497,6 +519,7 @@ class LiveEmulator(threading.Thread):
             'real': 0.0, 'load': 0.0, 'emu_s': 0.0, 'lag_ms': 0.0,
             'latency_ms': None, 'load_s': 0.0, 'terminal': False,
             'idle_skips': 0, 'latches': 0,
+            'ssi_blocks': 0, 'vec170': 0, 'vec191': 0,
         }
         self._latch = None
         self._watch = None               # (t_input, raw_before, instrs)
@@ -520,6 +543,12 @@ class LiveEmulator(threading.Thread):
     def _setup(self):
         t0 = time.monotonic()
         extra = {'syx': self.syx} if self.syx else {}
+        if self.ssi0_hz:
+            extra['ssi0_request_hz'] = int(self.ssi0_hz)
+            extra['ssi0_legacy_upgrade'] = not _has_ssi0_state(self.snapshot)
+            # One event per major loop (64 minors): exact at the interrupt,
+            # 64 times fewer emulator stops than one per request.
+            extra['ssi0_per_event'] = SSI0_MINORS_PER_BLOCK
         m, ev, st, pc, inq, at = build(
             self.snapshot, unblock=True, softfloat=True, bitmap=True,
             dsp=True, on_pixel=None, deferred_components=('timers',), **extra)
@@ -545,6 +574,36 @@ class LiveEmulator(threading.Thread):
                 if self.post_intro_ips:
                     self._pending_ips = self.post_intro_ips
             at(profile.intro_done, handover)
+
+        if self.ips:
+            # The emulated ColdFire's speed. digikit's default (4.68M, 4x
+            # after the intro) was calibrated to the screen's frame rate;
+            # the unit's MCF54418 runs at 250 MHz. With the audio clock on,
+            # the frame handler runs 1,500 times a second, and too low a
+            # rate leaves no time for the UI task. Idle skipping makes the
+            # spare time free, so a realistic rate costs only the real work.
+            for source in timers.sources:
+                source.ips = int(self.ips)
+            self.post_intro_ips = 0
+        self.ssi0 = ev.get('ssi0_dma')
+        self.intfrc = None
+        if self.ssi0 is not None:
+            # The sequencer runs on software-forced interrupts that the
+            # frame handler raises (emu/intfrc.py); vector 191 itself stays
+            # with the SSI model.
+            from emu import intfrc
+            self.intfrc = intfrc.install(m, ev, skip=(191,))
+            if not self.ssi0._checkpoint_restored or self.ips:
+                self.ssi0.ips = timers.sources[0].ips
+            self.ssi0.align(timers.now)
+            if self.dsp_sync:
+                # Stand-in for the SHARC: its sync word at the head of every
+                # row of both RX banks. The SSI model never writes RX data,
+                # so these stay put; the rest of each row reads as silence.
+                for bank in DSP_SYNC_BANKS:
+                    for row in range(DSP_SYNC_ROWS):
+                        m.uc.mem_write(bank + row * DSP_SYNC_ROW_BYTES,
+                                       DSP_SYNC_WORD)
 
         stats = self.stats
         if profile.mainloop is not None:
@@ -694,6 +753,8 @@ class LiveEmulator(threading.Thread):
         t0 = time.monotonic()
         win_t, win_emu, win_instrs, win_skip = t0, 0.0, 0, 0
         per_block = stepper.per_block
+        asyncs = tuple(e for e in (self.ssi0, getattr(self, 'intfrc', None))
+                       if e is not None)
         while not self.stop_flag.is_set():
             if self.pause.is_set():
                 stats['status'] = 'paused'
@@ -703,11 +764,14 @@ class LiveEmulator(threading.Thread):
             if self._pending_ips:
                 for source in timers.sources:
                     source.ips = self._pending_ips
+                if self.ssi0 is not None:
+                    self.ssi0.ips = self._pending_ips
                 self._pending_ips = None
             ips = timers.sources[0].ips
             pc = self._deliver(m, profile, pc, emu_s, ips)
             self._emu_s, self._step_ips = emu_s, ips
-            pc, executed, why = spin(m, pc, 1, pits=timers, fast=True)
+            pc, executed, why = spin(m, pc, 1, pits=timers, fast=True,
+                                     async_events=asyncs)
             if why != 'limit':
                 stats['status'] = 'halted: %s' % why
                 print('[live] HALTED: %s at pc=0x%08x' % (why, pc), flush=True)
@@ -731,6 +795,11 @@ class LiveEmulator(threading.Thread):
                 stats['pit'] = (fired.get('PIT0', 0), fired.get('PIT2', 0),
                                 fired.get('PIT3', 0))
                 stats['dtim3'] = fired.get('DTIM3', 0)
+                if self.ssi0 is not None:
+                    stats['ssi_blocks'] = self.ssi0.major_loops[50]
+                    stats['vec170'] = self.ssi0.vector170
+                    stats['vec191'] = self.ssi0.vector191
+                    stats['forced'] = dict(self.intfrc.taken)
                 if now - self._frame_t > 1.0:
                     stats['fps'] = 0.0
                 self.speed_log.append((round(stats['real'], 3),
@@ -881,12 +950,13 @@ def _window_classes():
         def __init__(self, snapshot, syx, keymap, speed=1.0, idle_skip=True,
                      dwell_ms=25.0, scale=None, verbose=False,
                      dtim0_hz=DTIM0_HZ, encoder_mode='step', raw_counts=4,
-                     save_at_exit=None):
+                     save_at_exit=None, ssi0_hz=None, dsp_sync=True, ips=None):
             self.keymap = keymap
             self._live = dict(syx=syx, speed=speed, idle_skip=idle_skip,
                               dwell_ms=dwell_ms, verbose=verbose,
                               dtim0_hz=dtim0_hz, encoder_mode=encoder_mode,
-                              raw_counts=raw_counts, save_at_exit=save_at_exit)
+                              raw_counts=raw_counts, save_at_exit=save_at_exit,
+                              ssi0_hz=ssi0_hz, dsp_sync=dsp_sync, ips=ips)
             self.keys = None
             self.help = None
             super().__init__(snapshot, syx=syx, scale=scale)
@@ -928,7 +998,10 @@ def _window_classes():
                                     dtim0_hz=o['dtim0_hz'],
                                     encoder_mode=o['encoder_mode'],
                                     raw_counts=o['raw_counts'],
-                                    save_at_exit=o['save_at_exit'])
+                                    save_at_exit=o['save_at_exit'],
+                                    ssi0_hz=o['ssi0_hz'],
+                                    dsp_sync=o['dsp_sync'],
+                                    ips=o['ips'])
             self.emu.start()
 
         def send_input(self, kind, code, arg):
@@ -1102,6 +1175,12 @@ def run_script(emu, keymap, lines, outdir, log=print):
     wait_frames(emu, keys, 0.1)
 
 
+def _has_ssi0_state(snapshot):
+    """-> True when the snapshot already carries an SSI0 component."""
+    from emu.snapshot import _load_blob
+    return 'ssi0_dma' in (_load_blob(snapshot).get('components') or {})
+
+
 def summary(emu):
     s = emu.stats
     lat = [ms for ms, _ in emu.latency]
@@ -1113,6 +1192,13 @@ def summary(emu):
         'idle skips %d' % (s['real'], 100 * s['load'], s['wall_ips'] / 1e6,
                            s['idle_skips']),
     ]
+    if emu.ssi0 is not None:
+        lines.append('audio clock %d Hz: %d blocks, vector 170 x%d, '
+                     'vector 191 x%d' % (emu.ssi0_hz, s['ssi_blocks'],
+                                         s['vec170'], s['vec191']))
+        lines.append('forced interrupts taken: %s' % (
+            ', '.join('vector %d x%d' % kv for kv in sorted(s.get('forced', {}).items()))
+            or 'none'))
     if lat:
         lat_sorted = sorted(lat)
         lines.append('input -> changed frame: n=%d  median %.0f ms  min %.0f  '
@@ -1147,6 +1233,15 @@ def main(argv=None):
                          'raw: send --raw-counts encoder counts per press and '
                          'let the firmware filter them as from the panel')
     ap.add_argument('--raw-counts', type=int, default=4)
+    ap.add_argument('--ssi0-hz', type=int, nargs='?', const=SSI0_HZ_DN2,
+                    help='run the audio clock (SSI0/eDMA48/50 model) at this '
+                         'request rate; bare flag = %d (Digitone II: one '
+                         'block per 32 samples at 48 kHz)' % SSI0_HZ_DN2)
+    ap.add_argument('--ips', type=float,
+                    help='emulated CPU instructions per second (default: the '
+                         'snapshot\'s timer rate); try 150e6 with --ssi0-hz')
+    ap.add_argument('--no-dsp-sync', action='store_true',
+                    help='with --ssi0-hz: do not plant the SHARC sync word')
     ap.add_argument('--scale', type=int)
     ap.add_argument('--verbose', action='store_true',
                     help='print every delivered input as a guirun --feed')
@@ -1174,7 +1269,9 @@ def main(argv=None):
                 idle_skip=not args.no_idle_skip, dwell_ms=args.dwell_ms,
                 scale=args.scale, verbose=args.verbose,
                 dtim0_hz=args.dtim0_hz, encoder_mode=args.encoder_mode,
-                raw_counts=args.raw_counts, save_at_exit=args.save).mainloop()
+                raw_counts=args.raw_counts, save_at_exit=args.save,
+                ssi0_hz=args.ssi0_hz, ips=args.ips,
+                dsp_sync=not args.no_dsp_sync).mainloop()
         return 0
 
     emu = LiveEmulator(args.snapshot, syx=args.syx, speed=args.speed,
@@ -1182,7 +1279,9 @@ def main(argv=None):
                        verbose=args.verbose, save_at_exit=args.save,
                        dtim0_hz=args.dtim0_hz,
                        encoder_mode=args.encoder_mode,
-                       raw_counts=args.raw_counts)
+                       raw_counts=args.raw_counts,
+                       ssi0_hz=args.ssi0_hz, dsp_sync=not args.no_dsp_sync,
+                       ips=args.ips)
     t0 = time.monotonic()
     emu.start()
     emu.ready.wait()
