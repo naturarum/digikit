@@ -11,6 +11,7 @@ from emu import symbols
 
 DT16 = Path("out/sections/dt2-1.16/section_3_MAIN_OS.bin")
 DN11 = Path("out/sections/dn2-1.11/section_3_MAIN_OS.bin")
+DN12 = Path("out/sections/dn2-1.12/section_3_MAIN_OS.bin")
 
 # Read only from emu/uitrace.py's UiTrace, which tools/guirun.py constructs
 # only under --trace-ui / --trace-ui-verbose / --trace-ui-json (see
@@ -32,7 +33,7 @@ DIAGNOSTIC_ONLY = frozenset({'transport', 'call_sites'})
 
 ALLOWED_NONE = TRACE_UI_ONLY | DIAGNOSTIC_ONLY
 
-IMAGES = {'dt2-1.16': DT16, 'dn2-1.11': DN11}
+IMAGES = {'dt2-1.16': DT16, 'dn2-1.11': DN11, 'dn2-1.12': DN12}
 
 
 class SymbolAuditTest(unittest.TestCase):
@@ -65,8 +66,8 @@ class SymbolAuditTest(unittest.TestCase):
                     pass  # informational only; not a failure
 
         if not ran:
-            self.skipTest('neither out/sections/dt2-1.16 nor '
-                          'out/sections/dn2-1.11 is extracted')
+            self.skipTest('none of out/sections/dt2-1.16, dn2-1.11 or '
+                          'dn2-1.12 is extracted')
 
     def test_fixed_rules_verify_on_both_images(self):
         """Every Fixed(...) rule (a literal address, optionally with a

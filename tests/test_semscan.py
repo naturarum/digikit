@@ -15,6 +15,7 @@ from emu import semscan, symbols
 DT15 = Path("out/sections/dt2-1.15C/section_3_MAIN_OS.bin")
 DT16 = Path("out/sections/dt2-1.16/section_3_MAIN_OS.bin")
 DN11 = Path("out/sections/dn2-1.11/section_3_MAIN_OS.bin")
+DN12 = Path("out/sections/dn2-1.12/section_3_MAIN_OS.bin")
 
 # emu/pit.py: PIT3 is the display frame timer, claimed by the display
 # module partway through boot and modelled from then on -- see
@@ -53,6 +54,10 @@ class SemscanTest(unittest.TestCase):
     @unittest.skipUnless(DN11.exists(), "DN2 1.11 image absent")
     def test_dn2_1_11(self):
         self._check_bq_pair_and_display_sem(DN11)
+
+    @unittest.skipUnless(DN12.exists(), "DN2 1.12 image absent")
+    def test_dn2_1_12(self):
+        self._check_bq_pair_and_display_sem(DN12)
 
     @unittest.skipUnless(DT16.exists(), "DT2 1.16 image absent")
     def test_vector_scan_finds_all_known_vectors_on_dt2_1_16(self):

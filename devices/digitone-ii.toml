@@ -27,6 +27,11 @@ version = "1.11"
 sha256 = "2af43e65e3d8390b41c9f66222620f8cce027d73ed87db00c80b440f628472e0"
 filename = "Digitone_II_OS1.11.syx"
 
+[[firmware]]
+version = "1.12"
+sha256 = "7e5b8a733d4ab1fdf7e5d22757f7d8eddaa3cbf71d0858874a791844c02ceb35"
+filename = "Digitone_II_OS1_12.syx"
+
 [panel]
 # The wire carries (channel, bit); the firmware reports a control code.
 # Channels 0..5 are linear -- code = channel * 8 + bit + 1, codes 1..48 --

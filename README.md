@@ -25,6 +25,7 @@ because much of the early analysis used them.
 | Digitone II | 1.11 | `Digitone_II_OS1.11.syx` | `2af43e65e3d8390b41c9f66222620f8cce027d73ed87db00c80b440f628472e0` |
 | Digitakt II | 1.15C | `Digitakt_II_OS1.15C.syx` | `62d588456e47194bd56dfee9568fb9dd4521c4ff1e8b5427eb461355532e8c6c` |
 | Digitone II | 1.10E | `Digitone_II_OS1.10E.syx` | `9881ee5ca4624be2b833e5eb94e294f2f8425371e6729781baccd1c256cac504` |
+| Digitone II | 1.12 | `Digitone_II_OS1_12.syx` | `7e5b8a733d4ab1fdf7e5d22757f7d8eddaa3cbf71d0858874a791844c02ceb35` |
 
 Keep each firmware's extracted sections in its own directory:
 `out/sections/dt2-1.16`, `out/sections/dn2-1.11`, and so on. The SHARC tools

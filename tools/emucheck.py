@@ -84,13 +84,29 @@ def setup(snapshot, syx):
 def run(args):
     m, ev, st, pc, inq, at, pits, profile = setup(args.snapshot, args.syx)
 
-    last_frame = {'buf': None}
+    last_frame = {'buf': None, 'new': False}
     if profile.panel_diff is not None and profile.fb_front is not None:
         def latch(uc, a, s, d):
             last_frame['buf'] = panel.read(m, profile.fb_front)
+            last_frame['new'] = True
         at(profile.panel_diff, latch)
 
-    pc, done, stop = spin(m, pc, args.instrs, chunk=args.chunk, pits=pits)
+    # The first timer step after which the latched frame is a main-screen
+    # frame. It only reads the frame latched above, from spin's on_chunk,
+    # so it moves no emu_start boundary and the run executes the same
+    # instruction stream as without it.
+    first_main = {'at': None, 'buf': None}
+
+    def watch(_pc, done_so_far):
+        if first_main['at'] is None and last_frame['new']:
+            last_frame['new'] = False
+            if frame_on_fraction(last_frame['buf']) >= MAIN_SCREEN_ON_FRACTION:
+                first_main['at'] = done_so_far
+                first_main['buf'] = last_frame['buf']
+
+    base_n = st.get('n', 0)
+    pc, done, stop = spin(m, pc, args.instrs, chunk=args.chunk, pits=pits,
+                          on_chunk=watch)
 
     # Force one more frame read at the end even if panel_diff never fired
     # again in the tail of the budget, so "no frame yet" isn't mistaken for
@@ -151,6 +167,20 @@ def run(args):
              header_bytes, ev.get('satisfied', 0), len(skip)))
     for r in reasons:
         print('  ' + r)
+    if first_main['at'] is None:
+        print('  main screen first latched: never')
+    else:
+        print('  main screen first latched: +%d instrs from the snapshot '
+              '(absolute %d)' % (first_main['at'], base_n + first_main['at']))
+    if args.png:
+        if frame is None:
+            print('  png: no frame latched, nothing written')
+        else:
+            print('  png: %s' % panel.write_png(frame, args.png))
+        if first_main['buf'] is not None:
+            stem, ext = os.path.splitext(args.png)
+            print('  png (first main-screen frame): %s'
+                  % panel.write_png(first_main['buf'], stem + '-first' + (ext or '.png')))
     return 0 if ok else 1
 
 
@@ -164,6 +194,8 @@ def main():
     ap.add_argument('--instrs', type=int, default=600_000_000)
     ap.add_argument('--chunk', type=int, default=10_000_000)
     ap.add_argument('--min-tasks', type=int, default=6)
+    ap.add_argument('--png', help='write the last latched frame here as a PNG, '
+                    'and the first main-screen frame next to it as <stem>-first.png')
     args = ap.parse_args()
     if args.sections:
         os.environ['DT2_SECTIONS'] = args.sections

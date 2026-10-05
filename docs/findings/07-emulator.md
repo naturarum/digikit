@@ -1355,6 +1355,35 @@ are 175 in the intro's exit park (`0x400d1930` on 1.16, `0x400d4038` on
 `None` on DT2 1.16 or DN2 1.11; eight trace-only symbols are still fixed 1.15C
 addresses. **[D][O]**
 
+## Digitone II 1.12 reaches the main screen with no address changes **[V][O]**
+
+The only change 1.12 needed was its sha256 in `devices/digitone-ii.toml`.
+`emu.extract` unpacks it with `dt2/elz.py` (MAIN OS 3,196,288 bytes, section
+8 159,948 bytes, as on 1.11). `emu.symbols` resolves every symbol the harness
+uses; the unresolved ones are the same allowlist `tests/test_symbol_audit.py`
+has for 1.11 (`transport`, `call_sites` and the eight trace-only 1.15C
+`Fixed` addresses). `semscan.never_fake_semaphores` gives the
+`bq_free_sem`/`bq_ready_sem` pair (`0x445f8474`/`0x445f847c`) and, with PIT3
+modelled, `display_sem` (`0x4461f6e8`). **[V]**
+
+The ladder (`out/snapshots/dn2-1.12/boot`, 6m44s) has the intro live and not
+parked at 120M to 400M (vector 208 = intro PIT3 handler `0x400d2ca4`), so
+`usable_rung` picks 400M, as on 1.11. The cold boot creates eight tasks; the
+prio-6 Main OS task (entry `0x4002ed34`, which falls through to `mainloop`
+`0x4002f178`) at instruction 315,718,166. From
+`boot400M.snap`, `tools/emucheck.py --instrs 600000000` passes: six
+resumed-run tasks (`0x400f27ce` p2, `0x40131d0a` p6, `0x401337c4` p5,
+`0x40133918` p4, `0x40133a3e` p4, `0x400f28e6` p3, the same priorities as
+1.15C's six), +Drive header written, 175 faked pends, all in the intro's exit
+park (`guirun.py` gives the return address, `0x400d3f6c`). The first main-screen frame (pattern A01,
+SYN 1 page) is latched at +341,578,400 instructions, absolute 741,578,400.
+Two runs gave the same count and byte-identical PNGs. `guirun.py` (the GUI's
+configuration) reaches the same frame by +300M with no faults.
+`tests/test_checkpoint_digitone_real.py` passes on 1.12. **[V]**
+
+Not checked on 1.12: the panel code mapping, the machine tables
+(`tools/machineprofile.py` has no 1.12 profile), the SHARC image. **[O]**
+
 ## Speed: measured on 1.16, and QEMU is not worth porting **[V]**
 
 `tools/speedab.py` times a fixed guest window from a snapshot (three fresh

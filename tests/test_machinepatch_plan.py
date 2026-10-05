@@ -53,7 +53,7 @@ def _try_main_image():
     if not os.path.exists(path):
         try:
             path = config.main_image()
-        except Exception:
+        except (Exception, config.NotFound):    # NotFound is a SystemExit
             return None
     if not os.path.exists(path):
         return None
