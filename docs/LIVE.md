@@ -83,8 +83,8 @@ accepted. `--keymap FILE` remaps (lines of `KEY KIND CODE [LABEL]`, KIND
 | ? | (host) | show or hide the key map |
 
 The third column comes from pressing each key from the main screen of a
-fresh project and reading the screen (out of the El-Fw workspace:
-`notes/T2.4a-live-control.md`). Command-key shortcuts are left to the Mac.
+fresh project and reading the screen (from the dn2-cfw project,
+https://github.com/naturarum/dn2-cfw, `notes/T2.4a-live-control.md`). Command-key shortcuts are left to the Mac.
 
 Holding an encoder key repeats it; after 8 repeats each repeat turns 2
 detents, then 4, then 8. Losing window focus releases every held key.
@@ -225,7 +225,7 @@ completion; bytes are logged with emulated time stamps.
 The ports need python-rtmidi: `uv run --with python-rtmidi python -m
 emu.live ...`. Only virtual ports are created; no device is opened.
 
-Checked on 1.12 (El-Fw `notes/T2.4c-midi-leds-speed.md`): with CLOCK SEND
+Checked on 1.12 (dn2-cfw `notes/T2.4c-midi-leds-speed.md`): with CLOCK SEND
 and TRANSPORT SEND switched on in SETTINGS > MIDI CONFIG > SYNC and track
 1 set to the MIDI machine (CHAN enabled with FUNC + encoder A push), PLAY
 sends `FA`, clock at 80.9 BPM (24 ppq) for the project's 81.0, and

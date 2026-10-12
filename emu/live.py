@@ -113,7 +113,7 @@ DTIM0_HZ = 132_000_000
 # blocks it installs the real channel-50 ISR (0x40025386), which forces
 # vector 191, the frame handler that runs the sequencer and the DSP frame.
 # 96,000 requests/s gives one major loop per 32-sample block at 48 kHz
-# (1,500 per second), the DSP's own block rate (El-Fw notes/T3.4).
+# (1,500 per second), the DSP's own block rate (dn2-cfw notes/T3.4).
 SSI0_HZ_DN2 = 96_000
 SSI0_MINORS_PER_BLOCK = 64
 DSP_SYNC_WORD = b'\x00\x7f\xff\xff'

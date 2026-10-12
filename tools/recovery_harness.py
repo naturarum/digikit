@@ -470,7 +470,7 @@ def main(argv=None):
         os.path.dirname(here) if os.path.basename(here) == '' else here,
         'ele3_out', '01_type2.unpacked.bin')
     if not os.path.exists(BOOT_IMAGE):
-        # fall back: alongside repo root two levels up from a .syx in El-Fw
+        # fall back: alongside repo root two levels up from a .syx in a dn2-cfw checkout
         alt = os.path.join(os.path.dirname(here), 'ele3_out', '01_type2.unpacked.bin')
         BOOT_IMAGE = alt if os.path.exists(alt) else BOOT_IMAGE
     boot = open(BOOT_IMAGE, 'rb').read()

@@ -1,6 +1,6 @@
 """Panel LEDs, decoded from what the firmware sends the panel MCU on UART8.
 
-Read from Digitone II 1.12 (El-Fw notes/T2.4c-midi-leds-speed.md), all
+Read from Digitone II 1.12 (dn2-cfw notes/T2.4c-midi-leds-speed.md), all
 through the UART8 transmit ring `FUN_4000220c` (eDMA 35, emu/edma.py):
 
 * `B9 index value` (`FUN_40132428`, `FUN_401320e8`): LED `index` (0-53)

@@ -1,6 +1,6 @@
 """DIN MIDI of the emulated unit: UART9 at 31,250 baud, out and in.
 
-Found on Digitone II 1.12 (El-Fw notes/T2.4c-midi-leds-speed.md); the
+Found on Digitone II 1.12 (dn2-cfw notes/T2.4c-midi-leds-speed.md); the
 addresses below are read from the running image, not assumed:
 
 * `0x400cedfc` initialises UART8 at 156,250 baud (the panel MCU) and

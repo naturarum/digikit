@@ -10,7 +10,7 @@ Digitone II 1.12 runs its sequencer on forced sources. The frame handler
 (vector 191) sets INTFRCH0 bit 12 at 0x40027afc: source 44, vector 108, the
 sequencer clock at 0x400d79c8, which clears it at 0x400d79da and sets
 INTFRCH0 bit 25 at 0x400d7d66: source 57, vector 121, the step handler
-0x400d99de (El-Fw notes/T2.2-arp-midi-v2.md). Without this model those
+0x400d99de (dn2-cfw notes/T2.2-arp-midi-v2.md). Without this model those
 writes land in plain memory and PLAY never steps.
 
 INTFRCH1 bit 31 (source 63, vector 191) is left to emu/ssi.py when that
